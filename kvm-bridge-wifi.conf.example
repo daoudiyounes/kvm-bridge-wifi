@@ -1,0 +1,28 @@
+# kvm-bridge-wifi configuration
+#
+# Installed to /etc/kvm-bridge-wifi/kvm-bridge-wifi.conf by `kvm-bridge-wifi install`.
+# You normally do not edit this: open the kvm-bridge-wifi window and press
+# Enable next to the VM you want.  If you do edit it by hand, apply the
+# change with:
+#
+#     sudo systemctl restart kvm-bridge-wifi
+
+[kvm-bridge-wifi]
+
+# Domains to bridge, comma separated.  Empty means nothing is enabled yet.
+# See them all with:  sudo virsh list --all
+vms =
+
+# The interface to send traffic out of.  "auto" picks the interface that
+# carries your default route, preferring a wireless one.
+uplink = auto
+
+# Let the host itself reach each guest on its LAN address.
+# Adds a /32 route into the tap.  Yes/no.
+host_access = yes
+
+# Handle IPv6 as well as IPv4.  Yes/no.
+ipv6 = yes
+
+# Log every forwarded frame.  Very noisy; for debugging only.
+verbose = no

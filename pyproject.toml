@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvm-bridge-wifi"
+version = "1.0.0"
+description = "Bridged VM networking over Wi-Fi for KVM/libvirt, without a real bridge"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["kvm", "libvirt", "virt-manager", "bridged-networking", "wifi", "qemu"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Emulators",
+]
+
+[project.urls]
+Homepage = "https://github.com/younesdaoudi/kvm-bridge-wifi"
+
+[project.scripts]
+kvm-bridge-wifi = "kvm_bridge_wifi:cli"
+kvm-bridge-wifi-gui = "kvm_bridge_wifi_gui:cli"
+kvm-bridge-wifi-tui = "kvm_bridge_wifi_tui:cli"
+
+[tool.setuptools]
+py-modules = ["kvm_bridge_wifi", "kvm_bridge_wifi_gui", "kvm_bridge_wifi_tui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

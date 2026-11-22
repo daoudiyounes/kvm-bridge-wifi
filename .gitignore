@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# local test output (but keep the README screenshot in docs/)
+*.ppm
+/*.png
+*.log
+state.json
+uv.lock

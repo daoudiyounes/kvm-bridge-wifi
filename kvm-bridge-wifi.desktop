@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=kvm-bridge-wifi
+GenericName=Bridged VM Networking
+Comment=Give a KVM virtual machine bridged networking over Wi-Fi
+Exec=/usr/local/bin/kvm-bridge-wifi-gui
+Icon=network-wireless
+Terminal=false
+Categories=System;Settings;Network;
+Keywords=vm;kvm;libvirt;virt-manager;bridge;wifi;network;
+StartupNotify=true
