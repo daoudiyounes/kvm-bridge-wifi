@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/younesdaoudi/kvm-bridge-wifi"
+Homepage = "https://github.com/daoudiyounes/kvm-bridge-wifi"
 
 [project.scripts]
 kvm-bridge-wifi = "kvm_bridge_wifi:cli"

@@ -16,7 +16,7 @@ work and will be declined.
 No dependencies beyond Python 3.10+ and the standard library.
 
 ```bash
-git clone https://github.com/younesdaoudi/kvm-bridge-wifi
+git clone https://github.com/daoudiyounes/kvm-bridge-wifi
 cd kvm-bridge-wifi
 python3 kvm_bridge_wifi.py selftest     # offline, no root needed
 python3 -m pytest -q               # same checks plus unit tests

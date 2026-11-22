@@ -20,7 +20,7 @@ router changes, no `br0`.
 Two commands, no VM name to remember:
 
 ```bash
-git clone https://github.com/younesdaoudi/kvm-bridge-wifi
+git clone https://github.com/daoudiyounes/kvm-bridge-wifi
 cd kvm-bridge-wifi
 sudo ./install.sh
 ```
@@ -41,7 +41,7 @@ Three ways, in order of how much they give you.
 ### 1. Clone and run the installer — recommended
 
 ```bash
-git clone https://github.com/younesdaoudi/kvm-bridge-wifi
+git clone https://github.com/daoudiyounes/kvm-bridge-wifi
 cd kvm-bridge-wifi
 sudo ./install.sh
 ```
@@ -60,7 +60,7 @@ sudo ./install.sh
 ### 2. pip or pipx
 
 ```bash
-pipx install git+https://github.com/younesdaoudi/kvm-bridge-wifi
+pipx install git+https://github.com/daoudiyounes/kvm-bridge-wifi
 sudo kvm-bridge-wifi install
 ```
 
