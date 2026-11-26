@@ -1671,21 +1671,79 @@ def require_root() -> bool:
     return True
 
 
-def wait_for_tap(vm: str, deadline: float, announced: "set[str] | None" = None) -> str | None:
-    """Wait until the VM has a live tap, or the shared deadline passes.
+def tap_rx_packets(tap: str) -> int:
+    """Packets the guest has sent into the tap (0 if unreadable)."""
+    try:
+        with open(f"/sys/class/net/{tap}/statistics/rx_packets", "r", encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 0
 
-    The deadline is absolute so that waiting for several VMs does not multiply
-    the timeout.
+
+def vm_health(vm: str, tap: str | None, ips: list[str]) -> tuple[str, str]:
     """
-    while time.time() < deadline:
-        tap = tap_for_vm(vm)
-        if tap and if_exists(tap):
-            return tap
-        if announced is not None and vm not in announced:
-            log(f"waiting for {vm} to start (Ctrl-C to stop waiting)")
-            announced.add(vm)
-        time.sleep(2.0)
-    return None
+    Work out why a VM is or is not bridged, as (state, advice).
+
+    The interesting case is a live tap with no traffic at all.  That means
+    the guest itself never brought its second NIC up, which is the single
+    most common reason this project "does not work": cloud images such as
+    Ubuntu's configure only the first interface, so the new NIC sits there
+    with no DHCP client.
+    """
+    if not vm_exists(vm):
+        return "deleted", "this VM no longer exists -- run: sudo kvm-bridge-wifi prune"
+
+    if not vm_has_ethernet_nic(vm):
+        return "no-nic", f"no bridged NIC yet -- run: sudo kvm-bridge-wifi setup-vm {vm}"
+
+    if not vm_running(vm):
+        return "stopped", "start the VM and it will be picked up automatically"
+
+    if not tap or not if_exists(tap):
+        return "starting", "waiting for the VM to finish starting"
+
+    if ips:
+        return "connected", f"reachable at {', '.join(ips)}"
+
+    if tap_rx_packets(tap) == 0:
+        return "guest-nic-down", (
+            "the guest's second network card is down or has no DHCP client. "
+            "Inside the guest run: ip link set <iface> up, then request a "
+            "lease (dhclient <iface>, or configure it in netplan/NetworkManager)"
+        )
+
+    return "no-lease", "traffic is flowing but no address yet -- check the AP allows DHCP"
+
+
+def filter_existing(vms: list[str], exists) -> tuple[list[str], list[str]]:
+    """Split enabled VMs into (still in libvirt, deleted).
+
+    Deleting a domain in virt-manager leaves its name in the config.  Those
+    entries must be reported and dropped, never silently "waited for" -- a
+    VM that does not exist can never start.
+    """
+    live, gone = [], []
+    for vm in vms:
+        (live if exists(vm) else gone).append(vm)
+    return live, gone
+
+
+def split_ready(vms: list[str], tap_lookup) -> tuple[list[tuple[str, str]], list[str]]:
+    """Split enabled VMs into "tap available now" and "not running yet".
+
+    Kept separate from cmd_run so the ordering rule can be tested: a VM that
+    is not running must never prevent a later VM from being bridged.  Every
+    VM is inspected, whatever order the config lists them in.
+    """
+    ready: list[tuple[str, str]] = []
+    pending: list[str] = []
+    for vm in vms:
+        tap = tap_lookup(vm)
+        if tap:
+            ready.append((vm, tap))
+        else:
+            pending.append(vm)
+    return ready, pending
 
 
 def module_dir() -> str:
@@ -2064,10 +2122,16 @@ def cmd_enable(args) -> int:
             return 1
         cfg["uplink"] = detected
 
+    # Drop VMs that were deleted from libvirt.  They would otherwise sit in
+    # the list forever, showing up in the window as "waiting for the VM to
+    # start" even though the VM no longer exists.
+    enabled, stale = filter_existing(parse_vms(cfg["vms"]), vm_exists)
+    for vm in stale:
+        log(f"forgetting {vm}: no such libvirt domain any more")
+
     if add_nic_to_vm(args.vm) != 0:
         return 1
 
-    enabled = parse_vms(cfg["vms"])
     if args.vm not in enabled:
         enabled.append(args.vm)
     cfg["vms"] = join_vms(enabled)
@@ -2077,6 +2141,37 @@ def cmd_enable(args) -> int:
         return 1
 
     log(f"enabled for {args.vm}; active: {', '.join(enabled)}")
+    return 0
+
+
+def cmd_prune(args) -> int:
+    """Forget enabled VMs that no longer exist in libvirt.
+
+    Deleting a domain in virt-manager leaves it in the config and in the
+    window forever.  This clears those entries; the GUI calls it on refresh.
+    """
+    if not require_root():
+        return 1
+
+    cfg = load_config(args.config)
+    remaining, stale = filter_existing(parse_vms(cfg["vms"]), vm_exists)
+    if not stale:
+        log("nothing to prune")
+        return 0
+
+    for vm in stale:
+        log(f"forgetting {vm}: no such libvirt domain")
+
+    cfg["vms"] = join_vms(remaining)
+    write_config(cfg, args.config)
+
+    store = StateStore(STATE_PATH)
+    for vm in stale:
+        store.remove(vm)
+
+    if _apply_service(remaining) != 0:
+        return 1
+    log(f"pruned {len(stale)}; still active: {', '.join(remaining) or 'none'}")
     return 0
 
 
@@ -2173,25 +2268,22 @@ def cmd_run(args) -> int:
                 log(f"--guest-ip: {item} is not a valid IPv4 address")
                 return 1
 
-    # Resolve a tap per VM.  One shared deadline, so waiting for three VMs
-    # does not mean waiting three times as long.
-    deadline = time.time() + args.wait
-    announced: set[str] = set()
+    # Bridging works in two stages so that one shut-down VM can never hold up
+    # the others:
+    #
+    #   1. Every VM whose tap exists right now is bridged immediately.
+    #   2. Every VM that is not running yet goes on a watch list.  A watcher
+    #      thread picks it up the moment its tap appears.
+    #
+    # Earlier versions waited for each VM in turn against one shared
+    # deadline, so a shut-down VM first in the list consumed the whole
+    # timeout and every later VM was skipped without ever being looked at.
     bridges: list[WiFiBridge] = []
+    pending: list[str] = []
+    bridge_lock = threading.Lock()
+    stopping = threading.Event()
 
-    for vm in vms:
-        guest = args.guest if (args.guest and len(vms) == 1) else None
-        if guest:
-            if not if_exists(guest):
-                log(f"tap {guest} does not exist")
-                return 1
-        else:
-            guest = wait_for_tap(vm, deadline, announced)
-            if not guest:
-                log(f"skipping {vm}: no unbridged NIC yet")
-                log(f"  fix with:  sudo kvm-bridge-wifi setup-vm {vm}")
-                continue
-
+    def make_bridge(vm: str, guest: str) -> WiFiBridge:
         # Per-VM remembered values.  The MAC is only a hint: libvirt may hand
         # the VM a new one, so learning stays enabled.
         seed_mac = None
@@ -2211,53 +2303,119 @@ def cmd_run(args) -> int:
                 if ip not in seed_ips:
                     seed_ips.append(ip)
 
-        log(f"bridging {vm} via {guest}")
-        bridges.append(
-            WiFiBridge(
-                uplink=uplink,
-                guest=guest,
-                guest_mac=guest_mac,
-                seed_mac=seed_mac,
-                handle_ipv6=not args.no_ipv6 and cfg_bool(cfg["ipv6"]),
-                verbose=args.verbose or cfg_bool(cfg["verbose"]),
-                dry_run=args.dry_run,
-                host_access=args.host_access or cfg_bool(cfg["host_access"]),
-                disable_offloads=not args.keep_offloads,
-                seed_ips=seed_ips,
-                state_store=store,
-                vm_name=vm,
-            )
+        return WiFiBridge(
+            uplink=uplink,
+            guest=guest,
+            guest_mac=guest_mac,
+            seed_mac=seed_mac,
+            handle_ipv6=not args.no_ipv6 and cfg_bool(cfg["ipv6"]),
+            verbose=args.verbose or cfg_bool(cfg["verbose"]),
+            dry_run=args.dry_run,
+            host_access=args.host_access or cfg_bool(cfg["host_access"]),
+            disable_offloads=not args.keep_offloads,
+            seed_ips=seed_ips,
+            state_store=store,
+            vm_name=vm,
         )
 
-    if not bridges:
-        log("nothing to bridge -- no VM had a usable tap")
+    def start_bridge(vm: str, guest: str) -> None:
+        log(f"bridging {vm} via {guest}")
+        bridge = make_bridge(vm, guest)
+        with bridge_lock:
+            bridges.append(bridge)
+        threading.Thread(
+            target=bridge.run, name=f"wb-{vm}", daemon=True
+        ).start()
+
+    def tap_now(vm: str) -> str | None:
+        """The VM's tap if it exists this instant, else None."""
+        if args.guest and len(vms) == 1:
+            return args.guest if if_exists(args.guest) else None
+        tap = tap_for_vm(vm)
+        return tap if tap and if_exists(tap) else None
+
+    # Ignore entries whose domain was deleted; otherwise they are "watched"
+    # forever and clutter the window with VMs that cannot ever start.
+    vms, gone = filter_existing(vms, vm_exists)
+    for vm in gone:
+        log(f"ignoring {vm}: no such libvirt domain (run 'kvm-bridge-wifi prune')")
+
+    if not vms:
+        log("no enabled VM exists any more -- run 'kvm-bridge-wifi prune'")
+        return 0
+
+    ready, pending = split_ready(vms, tap_now)
+    for vm, tap in ready:
+        start_bridge(vm, tap)
+
+    for vm in pending:
+        if not vm_has_ethernet_nic(vm):
+            log(f"{vm} has no unbridged NIC -- add one with:")
+            log(f"  sudo kvm-bridge-wifi setup-vm {vm}")
+
+    if not bridges and not pending:
+        log("nothing to bridge")
         return 1
 
     def _bye(*_args):
-        for bridge in bridges:
+        stopping.set()
+        with bridge_lock:
+            current = list(bridges)
+        for bridge in current:
             bridge.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _bye)
     signal.signal(signal.SIGINT, _bye)
-    atexit.register(lambda: [b.stop() for b in bridges])
+    atexit.register(_bye)
 
-    # Each bridge blocks in run(), so give each its own thread.
-    threads = [
-        threading.Thread(target=bridge.run, name=f"wb-{bridge.vm_name}", daemon=True)
-        for bridge in bridges
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    def watch() -> None:
+        """Start bridging a VM as soon as its tap appears, and re-arm it if
+        the VM is later shut down and started again."""
+        while not stopping.is_set():
+            for _ in range(3):  # 3 * 0.5s between sweeps
+                if stopping.is_set():
+                    return
+                time.sleep(0.5)
 
-    # A vanished tap means the VM was shut down or restarted.  Exit non-zero
-    # so systemd's Restart=on-failure re-arms us and we pick the tap up again
-    # when the VM comes back.  Exiting 0 here would leave the VM unbridged
-    # until someone noticed.
-    if any(bridge.tap_lost for bridge in bridges):
-        return 1
+            # A VM that stopped takes its tap with it; put it back on watch.
+            # Move it out of `bridges` and into `pending` under one lock so the
+            # main loop never sees a moment where neither list mentions it.
+            restarted: list[str] = []
+            with bridge_lock:
+                for bridge in [b for b in bridges if b.tap_lost]:
+                    bridges.remove(bridge)
+                    if bridge.vm_name not in pending:
+                        pending.append(bridge.vm_name)
+                        restarted.append(bridge.vm_name)
+            for vm in restarted:
+                log(f"{vm} stopped -- watching for it again")
+
+            for vm in list(pending):
+                if stopping.is_set():
+                    return
+                tap = tap_now(vm)
+                if not tap:
+                    continue
+                pending.remove(vm)
+                start_bridge(vm, tap)
+
+    if pending:
+        log(f"watching {len(pending)} VM(s) that are not running yet: "
+            f"{', '.join(pending)}")
+    threading.Thread(target=watch, name="wb-watch", daemon=True).start()
+
+    # Stay alive while any bridge is running or any VM is still expected.
+    while not stopping.is_set():
+        with bridge_lock:
+            idle = not bridges and not pending
+        if idle:
+            break
+        time.sleep(1.0)
+
+    if stopping.is_set():
+        return 0
+    log("all enabled VMs are gone")
     return 0
 
 
@@ -2293,14 +2451,18 @@ def cmd_status(args) -> int:
 
     print("vms:")
     for vm in vms:
-        tap = tap_for_vm(vm) or "-"
+        tap = tap_for_vm(vm)
         nic = "present" if vm_has_ethernet_nic(vm) else "MISSING"
         entry = store.get(vm)
-        ips = ", ".join(entry.get("guest_ips") or []) or "-"
+        ip_list = entry.get("guest_ips") or []
+        state, advice = vm_health(vm, tap, ip_list)
         print(f"  {vm}")
-        print(f"    nic:   {nic}")
-        print(f"    tap:   {tap}")
-        print(f"    guest: {ips}")
+        print(f"    nic:    {nic}")
+        print(f"    tap:    {tap or '-'}")
+        print(f"    guest:  {', '.join(ip_list) or '-'}")
+        print(f"    state:  {state}")
+        if state not in ("connected",):
+            print(f"            {advice}")
     return 0
 
 
@@ -2351,6 +2513,17 @@ def cmd_doctor(args) -> int:
         if vm_running(vm):
             tap = tap_for_vm(vm)
             check(f"{vm} tap {tap or '(none)'} exists", bool(tap) and if_exists(tap))
+
+            # A live tap that has never carried a packet means the guest
+            # never brought its second NIC up.  That is a guest problem, not
+            # a bridge problem, so report it as such.
+            if tap and if_exists(tap) and tap_rx_packets(tap) == 0:
+                print(f"[!!] {vm} has sent nothing through {tap}")
+                print("     -> the guest's second NIC is probably down or has no")
+                print("        DHCP client.  Inside the guest:")
+                print("          ip link set <iface> up")
+                print("          dhclient <iface>      (or configure netplan)")
+                problems += 1
         else:
             print(f"[--] {vm} is not running (the tap appears when it starts)")
 
@@ -2386,6 +2559,11 @@ def main(argv: list[str]) -> int:
     p_enable.add_argument("--vm", required=True, help="libvirt domain")
     p_enable.add_argument("--uplink", help="override the uplink")
     p_enable.add_argument("--config", default=CONFIG_PATH)
+
+    p_prune = sub.add_parser(
+        "prune", help="forget enabled VMs that no longer exist in libvirt"
+    )
+    p_prune.add_argument("--config", default=CONFIG_PATH)
 
     p_disable = sub.add_parser(
         "disable", help="stop bridging one VM (or all of them)"
@@ -2436,6 +2614,7 @@ def main(argv: list[str]) -> int:
         "setup-vm": cmd_setup_vm,
         "enable": cmd_enable,
         "disable": cmd_disable,
+        "prune": cmd_prune,
         "run": cmd_run,
         "status": cmd_status,
         "doctor": cmd_doctor,

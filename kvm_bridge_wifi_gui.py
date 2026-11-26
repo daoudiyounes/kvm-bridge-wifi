@@ -84,6 +84,24 @@ def require_gtk() -> None:
     raise SystemExit(1)
 
 KVM_BRIDGE_WIFI = shutil.which("kvm-bridge-wifi") or "/usr/local/bin/kvm-bridge-wifi"
+
+# The core module lives beside this one.  Importing it gives the window the
+# same diagnosis the command line uses, so the two never disagree.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import kvm_bridge_wifi as core
+except ImportError:  # pragma: no cover - only if installed oddly
+    core = None
+
+
+def diagnose(vm: str, tap, ips) -> tuple[str, str]:
+    """(state, advice) for one VM, or a safe fallback."""
+    if core is None:
+        return ("connected", "") if ips else ("stopped", "")
+    try:
+        return core.vm_health(vm, tap, ips)
+    except Exception:  # noqa: BLE001 - the window must never crash
+        return ("stopped", "")
 CONFIG_PATH = "/etc/kvm-bridge-wifi/kvm-bridge-wifi.conf"
 STATE_PATH = "/var/lib/kvm-bridge-wifi/state.json"
 UNIT_NAME = "kvm-bridge-wifi.service"
@@ -292,6 +310,7 @@ class Window(Gtk.Window if Gtk is not None else object):
         self.set_border_width(12)
 
         self.rows: dict[str, dict] = {}
+        self.machines: list[tuple[str, str]] = []
         self.busy = False
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -401,6 +420,8 @@ class Window(Gtk.Window if Gtk is not None else object):
         self.rows.clear()
 
         vms = list_vms()
+        self.machines = vms
+
         if not vms:
             row = Gtk.ListBoxRow()
             label = Gtk.Label(label="No virtual machines found.")
@@ -414,6 +435,26 @@ class Window(Gtk.Window if Gtk is not None else object):
 
         self.listbox.show_all()
         self._update_status()
+        self._prune_stale()
+
+    def _prune_stale(self) -> None:
+        """Forget enabled VMs whose domain no longer exists.
+
+        Run in the background so a password prompt (or a slow libvirt call)
+        never freezes the window.
+        """
+        known = {name for name, _state in self.machines}
+        stale = [vm for vm in enabled_vms() if vm not in known]
+        if not stale:
+            return
+
+        def worker() -> None:
+            try:
+                run_root([KVM_BRIDGE_WIFI, "prune"])
+            except Exception:  # noqa: BLE001 - never break the window
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _make_row(self, name: str, state: str) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
@@ -460,18 +501,37 @@ class Window(Gtk.Window if Gtk is not None else object):
         self.status_labels["service"].set_text("running" if active else "stopped")
         self.status_labels["uplink"].set_text(cfg.get("uplink", "-") or "-")
 
+        # Only show VMs that still exist in libvirt.  A domain deleted in
+        # virt-manager would otherwise linger here forever as "waiting".
+        known = {name for name, _state in self.machines}
+        live_enabled = [vm for vm in enabled if vm in known]
+
         state = read_state()
         lines = []
-        for vm in enabled:
+        for vm in live_enabled:
             tap = tap_for(vm)
-            ips = ", ".join((state.get(vm) or {}).get("guest_ips") or [])
-            if tap == "-":
+            tap_arg = None if tap == "-" else tap
+            ips = (state.get(vm) or {}).get("guest_ips") or []
+
+            kind, advice = diagnose(vm, tap_arg, ips)
+            if kind == "connected":
+                detail = f"{tap} → {', '.join(ips)}"
+            elif kind == "guest-nic-down":
+                # The one that catches everybody: the bridge is fine, the
+                # guest never configured its second card.
+                detail = f"{tap} → the guest's 2nd NIC is down / has no DHCP"
+            elif kind == "no-lease":
+                detail = f"{tap} → waiting for a DHCP lease"
+            elif kind == "stopped":
                 detail = "waiting for the VM to start"
-            elif ips:
-                detail = f"{tap} → {ips}"
             else:
-                detail = f"{tap} → no address yet"
+                detail = advice
             lines.append(f"{vm}  ({detail})")
+
+        stale = [vm for vm in enabled if vm not in known]
+        for vm in stale:
+            lines.append(f"{vm}  (deleted -- press Refresh to forget it)")
+
         self.bridged_label.set_text("\n".join(lines) if lines else "none")
 
     # -- actions ---------------------------------------------------------

@@ -254,7 +254,22 @@ def draw(stdscr, selected: int, message: str) -> None:
         if is_enabled:
             row += 1
             tap = tap_of(name)
-            address = ", ".join(ips.get(name) or []) or "waiting for the VM to start"
+            ip_list = ips.get(name) or []
+            address = ", ".join(ip_list)
+
+            if not address and wb is not None:
+                kind, _advice = wb.vm_health(
+                    name, None if tap == "-" else tap, ip_list
+                )
+                if kind == "guest-nic-down":
+                    address = "guest 2nd NIC down / no DHCP"
+                elif kind == "stopped":
+                    address = "waiting for the VM to start"
+                else:
+                    address = "waiting for a DHCP lease"
+            elif not address:
+                address = "waiting for the VM to start"
+
             addstr_safe(stdscr, row, 4, f"{tap}  ->  {address}", curses.A_DIM)
         row += 1
 
@@ -267,7 +282,10 @@ def draw(stdscr, selected: int, message: str) -> None:
     row += 1
     addstr_safe(stdscr, row, 1, f"uplink   {uplink()}")
     row += 1
-    addstr_safe(stdscr, row, 1, f"bridged  {', '.join(enabled) if enabled else 'none'}")
+    # Only name VMs that still exist; deleted domains are pruned on refresh.
+    known = {name for name, _state in machines}
+    live = [vm for vm in enabled if vm in known]
+    addstr_safe(stdscr, row, 1, f"bridged  {', '.join(live) if live else 'none'}")
 
     # message line
     if message:

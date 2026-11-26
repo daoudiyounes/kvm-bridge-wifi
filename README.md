@@ -20,7 +20,7 @@ router changes, no `br0`.
 Two commands, no VM name to remember:
 
 ```bash
-git clone https://github.com/daoudiyounes/kvm-bridge-wifi
+git clone https://github.com/younesdaoudi/kvm-bridge-wifi
 cd kvm-bridge-wifi
 sudo ./install.sh
 ```
@@ -41,7 +41,7 @@ Three ways, in order of how much they give you.
 ### 1. Clone and run the installer — recommended
 
 ```bash
-git clone https://github.com/daoudiyounes/kvm-bridge-wifi
+git clone https://github.com/younesdaoudi/kvm-bridge-wifi
 cd kvm-bridge-wifi
 sudo ./install.sh
 ```
@@ -60,7 +60,7 @@ sudo ./install.sh
 ### 2. pip or pipx
 
 ```bash
-pipx install git+https://github.com/daoudiyounes/kvm-bridge-wifi
+pipx install git+https://github.com/younesdaoudi/kvm-bridge-wifi
 sudo kvm-bridge-wifi install
 ```
 
@@ -330,8 +330,10 @@ re-run the installer to switch the menu entry to the window.
 3. The bridge **learns** each guest's MAC and IP from the traffic it sees,
    and remembers them in `/var/lib/kvm-bridge-wifi/state.json`.
 4. Every frame is rewritten as described above, in both directions.
-5. If a VM shuts down, the service exits non-zero so systemd restarts it —
-   that is how the VM gets bridged again automatically when you start it.
+5. VMs that are **not running** go on a watch list. The service bridges them
+   the moment they start, and puts them back on the list if they stop again.
+   A shut-down VM never holds up the others — every enabled VM is checked on
+   its own.
 
 Nothing is permanently changed about your host's networking. No `br0`, no
 `iptables` rules, no changes to `/etc/network/interfaces`.
@@ -363,6 +365,7 @@ sudo kvm-bridge-wifi status               # what is happening right now
 sudo kvm-bridge-wifi doctor               # check for common problems
 sudo kvm-bridge-wifi setup-vm NAME        # only add the NIC to a VM
 sudo kvm-bridge-wifi run                  # foreground mode (systemd runs this)
+sudo kvm-bridge-wifi prune                # forget VMs deleted from libvirt
 sudo kvm-bridge-wifi uninstall            # remove the service and menu entry
 sudo kvm-bridge-wifi uninstall --purge    # ...and delete the config and saved state
      kvm-bridge-wifi-tui                  # terminal interface, no dependencies
@@ -409,12 +412,61 @@ sudo kvm-bridge-wifi doctor
 
 **The guest gets no address / stays at 192.168.122.x**
 
+Run `sudo kvm-bridge-wifi status`. It prints a `state:` line per VM that
+tells you exactly which step is stuck:
+
+| state | meaning |
+|---|---|
+| `connected` | working |
+| `stopped` | VM is powered off — start it, the bridge picks it up automatically |
+| `starting` | VM is booting; the tap appears shortly |
+| `no-nic` | the VM has no bridged NIC yet — `sudo kvm-bridge-wifi setup-vm NAME` |
+| `deleted` | the VM no longer exists — `sudo kvm-bridge-wifi prune` |
+| `guest-nic-down` | **the guest never configured its second NIC** |
+| `no-lease` | traffic flows but no DHCP — check AP client isolation |
+
+**`guest-nic-down` is by far the most common.** The bridge is working
+perfectly; the guest simply never brought the new network card up. Most cloud
+images (Ubuntu, Debian cloud, Fedora cloud) only configure their **first**
+interface, so the card you added sits there unused.
+
+Fix it **inside the guest**:
+
+```bash
+# quick test — not persistent
+sudo ip link set enp7s0 up
+sudo dhclient enp7s0
+
+# Ubuntu / Debian cloud images (persistent)
+sudo tee /etc/netplan/60-kvm-bridge.yaml >/dev/null <<'EOF'
+network:
+  version: 2
+  ethernets:
+    enp7s0:
+      dhcp4: true
+      optional: true
+EOF
+sudo chmod 600 /etc/netplan/60-kvm-bridge.yaml
+sudo netplan apply
+```
+
+Replace `enp7s0` with the guest's second interface name — `ip -br a` inside
+the guest shows it (it is usually the one with no address).
+
+> netplan silently ignores files that other users can read, so the
+> `chmod 600` is required, not optional.
+
+On a NetworkManager guest instead:
+
+```bash
+sudo nmcli connection add type ethernet ifname enp7s0 con-name lan ipv4.method auto
+sudo nmcli connection up lan
+```
+
+**Other things to check**
+
 * Is the VM actually enabled? The button in the window should read
   **Disable**. If it says **Enable**, click it.
-* Is the bridge running? `sudo kvm-bridge-wifi status`
-* Does the VM have the extra NIC? `sudo kvm-bridge-wifi doctor` says
-  `... has a persistent unbridged NIC`. If not, it prints the exact command
-  to fix it.
 * Does your access point have **client isolation** / "AP isolation" on?
   Then the guest can reach the router but not other LAN devices. VirtualBox
   has the same limitation. Turn it off in the router settings.
